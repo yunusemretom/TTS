@@ -144,6 +144,11 @@ Underlined "TTS*" and "Judy*" are **internal** 🐸TTS models that are not relea
 You can also help us implement more models.
 
 ## Installation
+
+> **Bu çatal için:** aşağıdaki adımlar bugünkü paket sürümleriyle çalışmayan bir ortam
+> üretiyor (torch/CUDA uyumsuzluğu, `pkg_resources`, numpy 2, transformers 5). Denenmiş
+> kurulum, hızlı test ve hızlı çıkarım ayarları için **[KURULUM.md](KURULUM.md)**.
+
 🐸TTS is tested on Ubuntu 18.04 with **python >= 3.9, < 3.12.**.
 
 If you are only interested in [synthesizing speech](https://tts.readthedocs.io/en/latest/inference.html) with the released 🐸TTS models, installing from PyPI is the easiest option.

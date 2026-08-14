@@ -186,6 +186,39 @@ pip install deepspeed==0.10.3
 - `top_p`: Lower values mean the decoder produces more "likely" (aka boring) outputs. Defaults to 0.8.
 - `speed`: The speed rate of the generated audio. Defaults to 1.0. (can produce artifacts if far from 1.0)
 - `enable_text_splitting`: Whether to split the text into sentences and generate audio for each sentence. It allows you to have infinite input length but might loose important context between sentences. Defaults to True.
+- `batch_size`: How many of those sentences to decode at once. Defaults to 1 (one after another). See "Faster inference" below.
+
+##### Faster inference
+
+The autoregressive GPT produces one token at a time and reads all of its weights for each of
+them, so inference is paced by memory bandwidth rather than by arithmetic. Two settings follow
+from that, and they combine:
+
+- `load_checkpoint(..., half=True)` runs the GPT in float16, halving the traffic. The speaker
+  conditioning encoder and the vocoder stay in float32, where half precision is unstable and
+  buys nothing. On an existing model, `model.use_half_precision()` does the same thing.
+- `batch_size > 1` (with `enable_text_splitting=True`) decodes several sentences in the same
+  pass. Since the weights are read once for the whole batch, four sentences cost little more
+  than one. Sentences are grouped by length and the result is identical to decoding them one
+  by one.
+
+On an RTX 4050 Laptop, reading a paragraph aloud goes from a real-time factor of 0.26 to 0.09
+with `half=True` and `batch_size=4`.
+
+Note that the 🐸TTS API splits text into sentences before it reaches the model, so batching
+only kicks in when you let the model do the splitting instead:
+
+```python
+tts.tts_to_file(
+    text=long_text,
+    speaker_wav="reference.wav",
+    language="en",
+    file_path="output.wav",
+    split_sentences=False,   # hand the whole text to XTTS
+    enable_text_splitting=True,
+    batch_size=4,
+)
+```
 
 
 ##### Inference

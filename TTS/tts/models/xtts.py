@@ -254,6 +254,27 @@ class Xtts(BaseTTS):
     def device(self):
         return next(self.parameters()).device
 
+    def use_half_precision(self):
+        """Run the autoregressive GPT in float16.
+
+        Decoding is paced by reading the GPT weights, so halving them is the cheapest real
+        speedup available. The speaker conditioning encoder is left in float32: it overflows
+        in half precision and produces NaN latents, and it runs once per call, so it costs
+        nothing to keep. The vocoder stays in float32 for the same reason.
+
+        Inference only -- the model must already be in eval mode.
+        """
+        self.gpt.half()
+        self.gpt.conditioning_encoder.float()
+        if self.args.gpt_use_perceiver_resampler:
+            self.gpt.conditioning_perceiver.float()
+        return self
+
+    @property
+    def hifigan_decoder_dtype(self):
+        """Dtype of the vocoder, which may differ from the GPT's when running it in half precision."""
+        return next(self.hifigan_decoder.parameters()).dtype
+
     @torch.inference_mode()
     def get_gpt_cond_latents(self, audio, sr, length: int = 30, chunk_length: int = 6):
         """Compute the conditioning latents for the GPT model from the given audio.
@@ -499,6 +520,65 @@ class Xtts(BaseTTS):
             **hf_generate_kwargs,
         )
 
+    def _generate_gpt_codes(self, text_tokens_list, gpt_cond_latent, batch_size, **gpt_generate_kwargs):
+        """Run the autoregressive GPT over every sentence, batching `batch_size` of them at a time.
+
+        The decoding loop is bound by reading the GPT weights rather than by arithmetic, so
+        sentences decoded together cost little more than a single one. Batching is skipped
+        when `gpt_batch_size` asks for several samples per sentence, since the two ways of
+        using the batch dimension cannot be combined.
+        """
+        if batch_size < 1:
+            raise ValueError(f" ❗ batch_size must be >= 1, got {batch_size}")
+        if batch_size == 1 or self.gpt_batch_size != 1:
+            return [
+                self.gpt.generate(
+                    cond_latents=gpt_cond_latent,
+                    text_inputs=text_tokens,
+                    input_tokens=None,
+                    num_return_sequences=self.gpt_batch_size,
+                    **gpt_generate_kwargs,
+                )
+                for text_tokens in text_tokens_list
+            ]
+
+        start_token, stop_token = self.gpt.start_text_token, self.gpt.stop_text_token
+        # A batch runs until its longest sentence is done, so group sentences of similar
+        # length together to waste as few decoding steps as possible. Results do not depend
+        # on how sentences are grouped, so the original order is simply restored afterwards.
+        order = sorted(range(len(text_tokens_list)), key=lambda i: text_tokens_list[i].shape[-1])
+        gpt_codes_by_index = {}
+        for i in range(0, len(order), batch_size):
+            indices = order[i : i + batch_size]
+            chunk = [text_tokens_list[j] for j in indices]
+            if len(chunk) == 1:
+                gpt_codes_by_index[indices[0]] = self.gpt.generate(
+                    cond_latents=gpt_cond_latent,
+                    text_inputs=chunk[0],
+                    input_tokens=None,
+                    num_return_sequences=self.gpt_batch_size,
+                    **gpt_generate_kwargs,
+                )
+                continue
+
+            # add the start/stop tokens here so that padding lands after the stop token and
+            # every sentence keeps the positional embeddings it would get on its own
+            rows = [F.pad(F.pad(tokens, (0, 1), value=stop_token), (1, 0), value=start_token) for tokens in chunk]
+            text_lengths = torch.tensor([row.shape[-1] for row in rows], device=self.device)
+            max_len = int(text_lengths.max())
+            padded = torch.cat([F.pad(row, (0, max_len - row.shape[-1]), value=stop_token) for row in rows], dim=0)
+
+            codes = self.gpt.generate_batch(
+                cond_latents=gpt_cond_latent.expand(len(chunk), -1, -1),
+                text_inputs=padded,
+                text_lengths=text_lengths,
+                input_tokens=None,
+                num_return_sequences=1,
+                **gpt_generate_kwargs,
+            )
+            gpt_codes_by_index.update(zip(indices, codes))
+        return [gpt_codes_by_index[i] for i in range(len(text_tokens_list))]
+
     @torch.inference_mode()
     def inference(
         self,
@@ -516,6 +596,7 @@ class Xtts(BaseTTS):
         num_beams=1,
         speed=1.0,
         enable_text_splitting=False,
+        batch_size=1,
         **hf_generate_kwargs,
     ):
         language = language.split("-")[0]  # remove the country code
@@ -527,8 +608,7 @@ class Xtts(BaseTTS):
         else:
             text = [text]
 
-        wavs = []
-        gpt_latents_list = []
+        text_tokens_list = []
         for sent in text:
             sent = sent.strip().lower()
             text_tokens = torch.IntTensor(self.tokenizer.encode(sent, lang=language)).unsqueeze(0).to(self.device)
@@ -536,23 +616,28 @@ class Xtts(BaseTTS):
             assert (
                 text_tokens.shape[-1] < self.args.gpt_max_text_tokens
             ), " ❗ XTTS can only generate text with a maximum of 400 tokens."
+            text_tokens_list.append(text_tokens)
 
+        with torch.no_grad():
+            gpt_codes_list = self._generate_gpt_codes(
+                text_tokens_list,
+                gpt_cond_latent,
+                batch_size,
+                do_sample=do_sample,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                num_beams=num_beams,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
+                output_attentions=False,
+                **hf_generate_kwargs,
+            )
+
+        wavs = []
+        gpt_latents_list = []
+        for text_tokens, gpt_codes in zip(text_tokens_list, gpt_codes_list):
             with torch.no_grad():
-                gpt_codes = self.gpt.generate(
-                    cond_latents=gpt_cond_latent,
-                    text_inputs=text_tokens,
-                    input_tokens=None,
-                    do_sample=do_sample,
-                    top_p=top_p,
-                    top_k=top_k,
-                    temperature=temperature,
-                    num_return_sequences=self.gpt_batch_size,
-                    num_beams=num_beams,
-                    length_penalty=length_penalty,
-                    repetition_penalty=repetition_penalty,
-                    output_attentions=False,
-                    **hf_generate_kwargs,
-                )
                 expected_output_len = torch.tensor(
                     [gpt_codes.shape[-1] * self.gpt.code_stride_len], device=text_tokens.device
                 )
@@ -574,6 +659,7 @@ class Xtts(BaseTTS):
                     ).transpose(1, 2)
 
                 gpt_latents_list.append(gpt_latents.cpu())
+                gpt_latents = gpt_latents.to(self.hifigan_decoder_dtype)
                 wavs.append(self.hifigan_decoder(gpt_latents, g=speaker_embedding).cpu().squeeze())
 
         return {
@@ -684,6 +770,7 @@ class Xtts(BaseTTS):
                         gpt_latents = F.interpolate(
                             gpt_latents.transpose(1, 2), scale_factor=length_scale, mode="linear"
                         ).transpose(1, 2)
+                    gpt_latents = gpt_latents.to(self.hifigan_decoder_dtype)
                     wav_gen = self.hifigan_decoder(gpt_latents, g=speaker_embedding.to(self.device))
                     wav_chunk, wav_gen_prev, wav_overlap = self.handle_chunks(
                         wav_gen.squeeze(), wav_gen_prev, wav_overlap, overlap_wav_len
@@ -738,6 +825,7 @@ class Xtts(BaseTTS):
         strict=True,
         use_deepspeed=False,
         speaker_file_path=None,
+        half=False,
     ):
         """
         Loads a checkpoint from disk and initializes the model's state and tokenizer.
@@ -749,10 +837,16 @@ class Xtts(BaseTTS):
             vocab_path (str, optional): The path to the vocabulary file. Defaults to None.
             eval (bool, optional): Whether to set the model to evaluation mode. Defaults to True.
             strict (bool, optional): Whether to strictly enforce that the keys in the checkpoint match the keys in the model. Defaults to True.
+            half (bool, optional): Run the autoregressive GPT in float16. The decoding loop is bound by
+                reading the GPT weights, so this roughly halves the traffic that sets its pace. The
+                vocoder is left in float32, where it is cheap and better conditioned. Inference only;
+                requires `eval=True`. Defaults to False.
 
         Returns:
             None
         """
+        if half and not eval:
+            raise ValueError(" ❗ half precision is only supported for inference, pass eval=True")
 
         model_path = checkpoint_path or os.path.join(checkpoint_dir, "model.pth")
         vocab_path = vocab_path or os.path.join(checkpoint_dir, "vocab.json")
@@ -784,6 +878,8 @@ class Xtts(BaseTTS):
             self.hifigan_decoder.eval()
             self.gpt.init_gpt_for_inference(kv_cache=self.args.kv_cache, use_deepspeed=use_deepspeed)
             self.gpt.eval()
+            if half:
+                self.use_half_precision()
 
     def train_step(self):
         raise NotImplementedError(

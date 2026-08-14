@@ -1,6 +1,5 @@
 # ported from: https://github.com/neonbjb/tortoise-tts
 
-import functools
 import math
 import random
 
@@ -14,8 +13,27 @@ from TTS.tts.layers.xtts.latent_encoder import ConditioningEncoder
 from TTS.tts.layers.xtts.perceiver_encoder import PerceiverResampler
 
 
-def null_position_embeddings(range, dim):
-    return torch.zeros((range.shape[0], range.shape[1], dim), device=range.device)
+class NullPositionEmbeddings(nn.Module):
+    """Stand-in for an unused position embedding table.
+
+    Kept as a module rather than a plain function so that its output dtype follows
+    ``.half()`` / ``.to()`` on the parent model. Returning hardcoded float32 zeros
+    would promote the activations back to float32 when added to the input
+    embeddings, which silently defeats half precision inference.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        # non-persistent so it stays out of the checkpoint's state_dict
+        self.register_buffer("_dtype_probe", torch.zeros(1), persistent=False)
+
+    def forward(self, range):  # pylint: disable=redefined-builtin
+        return torch.zeros(
+            (range.shape[0], range.shape[1], self.dim),
+            device=range.device,
+            dtype=self._dtype_probe.dtype,
+        )
 
 
 class LearnedPositionEmbeddings(nn.Module):
@@ -67,19 +85,19 @@ def build_hf_gpt_transformer(
     gpt = GPT2Model(gpt_config)
     # Override the built in positional embeddings
     del gpt.wpe
-    gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)
+    gpt.wpe = NullPositionEmbeddings(model_dim)
     # Built-in token embeddings are unused.
     del gpt.wte
 
     mel_pos_emb = (
         LearnedPositionEmbeddings(max_mel_seq_len, model_dim)
         if max_mel_seq_len != -1
-        else functools.partial(null_position_embeddings, dim=model_dim)
+        else NullPositionEmbeddings(model_dim)
     )
     text_pos_emb = (
         LearnedPositionEmbeddings(max_text_seq_len, model_dim)
         if max_mel_seq_len != -1
-        else functools.partial(null_position_embeddings, dim=model_dim)
+        else NullPositionEmbeddings(model_dim)
     )
     # gpt = torch.compile(gpt, mode="reduce-overhead", fullgraph=True)
     return gpt, mel_pos_emb, text_pos_emb, None, None
@@ -359,6 +377,9 @@ class GPT(nn.Module):
         if not return_latent:
             if cond_input.ndim == 4:
                 cond_input = cond_input.squeeze(1)
+            # the reference mel is always computed in float32; follow the encoder's dtype so
+            # that the model can be run in half precision
+            cond_input = cond_input.to(next(self.conditioning_encoder.parameters()).dtype)
             conds = self.conditioning_encoder(cond_input)  # (b, d, s)
             if self.use_perceiver_resampler:
                 conds = self.conditioning_perceiver(conds.permute(0, 2, 1)).transpose(1, 2)  # (b, d, 32)
@@ -502,6 +523,7 @@ class GPT(nn.Module):
         # Compute speech conditioning input
         if cond_latents is None:
             cond_latents = self.get_style_emb(cond_mels).transpose(1, 2)
+        cond_latents = cond_latents.to(text_emb.dtype)
 
         # Get logits
         sub = -5  # don't ask me why 😄
@@ -566,7 +588,9 @@ class GPT(nn.Module):
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs = F.pad(text_inputs, (1, 0), value=self.start_text_token)
         emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
-        emb = torch.cat([cond_latents, emb], dim=1)
+        # follow the model's dtype: float32 latents would promote the whole prefix back to
+        # float32 and silently undo half precision inference
+        emb = torch.cat([cond_latents.to(emb.dtype), emb], dim=1)
         self.gpt_inference.store_prefix_emb(emb)
         gpt_inputs = torch.full(
             (
@@ -598,6 +622,77 @@ class GPT(nn.Module):
         if "return_dict_in_generate" in hf_generate_kwargs:
             return gen.sequences[:, gpt_inputs.shape[1] :], gen
         return gen[:, gpt_inputs.shape[1] :]
+
+    def compute_embeddings_batch(self, cond_latents, text_inputs, text_lengths):
+        """Batched counterpart of :meth:`compute_embeddings`.
+
+        Unlike the single-sequence path, the start/stop text tokens are expected to be
+        part of ``text_inputs`` already, so that every sentence keeps the same positional
+        embeddings it would get on its own; the padding sits after the stop token and is
+        hidden with the returned attention mask.
+
+        Args:
+            cond_latents: conditioning latents, ``(B, cond_len, dim)``.
+            text_inputs: right-padded ``[start, tokens..., stop]`` sequences, ``(B, T)``.
+            text_lengths: real length of each row of ``text_inputs``, ``(B,)``.
+
+        Returns:
+            Tuple of the placeholder gpt inputs ``(B, cond_len + T + 1)`` and the matching
+            attention mask.
+        """
+        emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
+        emb = torch.cat([cond_latents.to(emb.dtype), emb], dim=1)
+        self.gpt_inference.store_prefix_emb(emb)
+
+        gpt_inputs = torch.full(
+            (emb.shape[0], emb.shape[1] + 1),  # +1 for the start_audio_token
+            fill_value=1,
+            dtype=torch.long,
+            device=text_inputs.device,
+        )
+        gpt_inputs[:, -1] = self.start_audio_token
+
+        cond_len = cond_latents.shape[1]
+        positions = torch.arange(text_inputs.shape[1], device=text_inputs.device)
+        attention_mask = torch.ones_like(gpt_inputs)
+        attention_mask[:, cond_len : cond_len + text_inputs.shape[1]] = (
+            positions[None, :] < text_lengths[:, None]
+        ).long()
+        return gpt_inputs, attention_mask
+
+    def generate_batch(
+        self,
+        cond_latents,
+        text_inputs,
+        text_lengths,
+        **hf_generate_kwargs,
+    ):
+        """Generate mel codes for several sentences at once.
+
+        The autoregressive loop is bound by reading the model weights, so decoding a batch
+        costs barely more than decoding a single sequence. Returns one code sequence per
+        row, each already trimmed at its own stop token.
+        """
+        gpt_inputs, attention_mask = self.compute_embeddings_batch(cond_latents, text_inputs, text_lengths)
+        gen = self.gpt_inference.generate(
+            gpt_inputs,
+            attention_mask=attention_mask,
+            bos_token_id=self.start_audio_token,
+            pad_token_id=self.stop_audio_token,
+            eos_token_id=self.stop_audio_token,
+            max_length=self.max_gen_mel_tokens + gpt_inputs.shape[-1],
+            **hf_generate_kwargs,
+        )
+        codes = gen[:, gpt_inputs.shape[1] :]
+
+        # Sequences that stopped early are padded with stop tokens up to the longest one;
+        # cut each back to its own stop token, which is what single-sentence decoding returns.
+        trimmed = []
+        for row in codes:
+            stops = (row == self.stop_audio_token).nonzero()
+            end = stops[0].item() + 1 if len(stops) > 0 else row.shape[0]
+            trimmed.append(row[:end].unsqueeze(0))
+        return trimmed
 
     def get_generator(self, fake_inputs, **hf_generate_kwargs):
         return self.gpt_inference.generate_stream(

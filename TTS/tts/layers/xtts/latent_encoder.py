@@ -8,8 +8,21 @@ from torch.nn import functional as F
 
 
 class GroupNorm32(nn.GroupNorm):
+    """GroupNorm that always normalizes in float32, whatever dtype the model runs in.
+
+    The weights have to be cast along with the input: `super().forward(x.float())` would
+    otherwise feed float32 activations to half precision parameters.
+    """
+
     def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+        out = F.group_norm(
+            x.float(),
+            self.num_groups,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return out.type(x.dtype)
 
 
 def conv_nd(dims, *args, **kwargs):

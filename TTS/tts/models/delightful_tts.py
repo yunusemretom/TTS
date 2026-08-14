@@ -38,19 +38,21 @@ from TTS.vocoder.utils.generic_utils import plot_results
 
 
 def id_to_torch(aux_id, cuda=False):
-    if aux_id is not None:
-        aux_id = np.asarray(aux_id)
-        aux_id = torch.from_numpy(aux_id)
+    if aux_id is None:
+        return None
+    aux_id = np.asarray(aux_id)
+    aux_id = torch.from_numpy(aux_id)
     if cuda:
         return aux_id.cuda()
     return aux_id
 
 
 def embedding_to_torch(d_vector, cuda=False):
-    if d_vector is not None:
-        d_vector = np.asarray(d_vector)
-        d_vector = torch.from_numpy(d_vector).float()
-        d_vector = d_vector.squeeze().unsqueeze(0)
+    if d_vector is None:
+        return None
+    d_vector = np.asarray(d_vector)
+    d_vector = torch.from_numpy(d_vector).float()
+    d_vector = d_vector.squeeze().unsqueeze(0)
     if cuda:
         return d_vector.cuda()
     return d_vector

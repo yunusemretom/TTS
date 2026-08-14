@@ -397,7 +397,7 @@ class ForwardTTS(BaseTTS):
             - g: :math:`(B, C)`
         """
         if hasattr(self, "emb_g"):
-            g = g.type(torch.LongTensor)
+            g = g.long()  # `.type(torch.LongTensor)` would move the ids to CPU, away from `emb_g`
             g = self.emb_g(g)  # [B, C, 1]
         if g is not None:
             g = g.unsqueeze(-1)
